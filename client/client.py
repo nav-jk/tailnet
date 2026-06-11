@@ -1,5 +1,6 @@
 import time
 import threading
+import base64
 from dataclasses import dataclass
 import requests
 import schedule
@@ -8,7 +9,9 @@ from rich.table import Table
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
+from nacl.public import PublicKey
 from stun_client import discover_endpoint_with_fallback
+from encrypt import generate_key, encrypt, decrypt
 
 BASE_URL = "http://129.121.114.238:8000"
 
@@ -21,16 +24,21 @@ class Client:
     username: str
     ip: str
     port: int
+    public_key: str   # base64-encoded string for transport
+    private_key: object  # nacl PrivateKey object
 
 client: Client | None = None
 USERNAME: str = ""
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind(("", 0))
-sock.settimeout(0.5)   # ← non-blocking enough for recv loop, safe for sendto
+sock.settimeout(0.5)
 
 incoming_messages: list[tuple[tuple, str]] = []
 _msg_lock = threading.Lock()
+
+# The public key of whoever we're currently chatting with (nacl PublicKey object)
+_current_peer_public_key: PublicKey | None = None
 
 # Signals the chat printer thread to stop when we leave chat
 _in_chat = threading.Event()
@@ -43,22 +51,33 @@ def parse_peer(data: dict) -> dict:
         "username": data["username"],
         "ip":       str(data["ip"]),
         "port":     int(data["port"]),
+        "public_key": str(data["public_key"])   # base64 string
     }
+
+
+def peer_public_key_obj(peer: dict) -> PublicKey:
+    """Decode a peer's base64 public key string into a nacl PublicKey."""
+    return PublicKey(base64.b64decode(peer["public_key"]))
 
 
 # ── STUN / Registration ───────────────────────────────────────────────────────
 
-def discover_endpoint() -> Client:
+def discover_endpoint() -> tuple[str, int]:
     external_ip, external_port = discover_endpoint_with_fallback(sock)
     console.print(f"[dim][STUN] {external_ip}:{external_port}[/dim]")
-    return Client(username=USERNAME, ip=external_ip, port=external_port)
+    return external_ip, external_port
 
 
 def register():
     try:
         r = requests.post(
             f"{BASE_URL}/register",
-            json={"username": client.username, "ip": client.ip, "port": client.port},
+            json={
+                "username":   client.username,
+                "ip":         client.ip,
+                "port":       client.port,
+                "public_key": client.public_key,
+            },
             timeout=5,
         )
         console.print(f"[dim][REGISTER] {r.status_code}[/dim]")
@@ -69,10 +88,11 @@ def register():
 def refresh_endpoint():
     global client
     try:
-        new = discover_endpoint()
-        if client is None or new.ip != client.ip or new.port != client.port:
-            console.print(f"[yellow][UPDATE] {new.ip}:{new.port}[/yellow]")
-            client = new
+        new_ip, new_port = discover_endpoint()
+        if client is None or new_ip != client.ip or new_port != client.port:
+            console.print(f"[yellow][UPDATE] {new_ip}:{new_port}[/yellow]")
+            client.ip   = new_ip
+            client.port = new_port
             register()
         else:
             console.print("[dim][UPDATE] Endpoint unchanged[/dim]")
@@ -84,7 +104,12 @@ def heartbeat():
     try:
         r = requests.post(
             f"{BASE_URL}/register",
-            json={"username": client.username, "ip": client.ip, "port": client.port},
+            json={
+                "username":   client.username,
+                "ip":         client.ip,
+                "port":       client.port,
+                "public_key": client.public_key,
+            },
             timeout=5,
         )
         console.print(f"[dim][HEARTBEAT] {r.status_code}[/dim]")
@@ -99,13 +124,24 @@ def udp_receiver():
     while True:
         try:
             data, addr = sock.recvfrom(4096)
-            decoded = data.decode(errors="replace")
+
+            # Only decrypt if we have a peer key (i.e. we're in a chat)
+            peer_key = _current_peer_public_key
+            if peer_key is None:
+                continue
+
+            try:
+                data_decrypt = decrypt(client.private_key, peer_key, data)
+            except Exception:
+                continue  # Undecryptable packet — ignore
+
+            decoded = data_decrypt.decode(errors="replace")
             if decoded in ("HOLEPUNCH", "HELLO"):
                 continue
             with _msg_lock:
                 incoming_messages.append((addr, decoded))
         except socket.timeout:
-            continue          # normal — just loop again
+            continue
         except Exception as e:
             console.print(f"[red][UDP ERROR] {e}[/red]")
 
@@ -115,13 +151,11 @@ def udp_receiver():
 def chat_printer(peer_name: str):
     """
     While in chat, continuously drain incoming_messages and print them.
-    Runs as a daemon thread so Prompt.ask on the main thread isn't blocked.
     """
     while _in_chat.is_set():
         with _msg_lock:
             while incoming_messages:
                 addr, msg = incoming_messages.pop(0)
-                # Print above the current input line
                 console.print(
                     f"\n[green]{peer_name}[/green] "
                     f"[dim]({addr[0]}:{addr[1]})[/dim]: {msg}"
@@ -144,9 +178,14 @@ def hole_punch(peer_ip: str, peer_port: int, rounds: int = 20):
 # ── Chat Window ───────────────────────────────────────────────────────────────
 
 def chat_window(peer: dict):
+    global _current_peer_public_key
+
     peer_ip   = peer["ip"]
     peer_port = peer["port"]
     peer_name = peer["username"]
+
+    # Decode peer's public key once for this session
+    _current_peer_public_key = peer_public_key_obj(peer)
 
     console.clear()
     console.print(
@@ -177,11 +216,13 @@ def chat_window(peer: dict):
             break
 
         try:
-            sock.sendto(msg.encode(), (peer_ip, peer_port))
+            encrypted = encrypt(client.private_key, _current_peer_public_key, msg.encode())
+            sock.sendto(encrypted, (peer_ip, peer_port))
         except Exception as e:
             console.print(f"[red]Send error: {e}[/red]")
 
     _in_chat.clear()
+    _current_peer_public_key = None
     console.print("[yellow]Left chat.[/yellow]")
 
 
@@ -309,7 +350,19 @@ def main():
 
     USERNAME = Prompt.ask("[bold cyan]Enter your username[/bold cyan]")
 
-    client = discover_endpoint()
+    # Generate keypair ONCE at startup
+    private_key, public_key = generate_key()
+    public_key_b64 = base64.b64encode(bytes(public_key)).decode()
+
+    external_ip, external_port = discover_endpoint()
+
+    client = Client(
+        username=USERNAME,
+        ip=external_ip,
+        port=external_port,
+        public_key=public_key_b64,
+        private_key=private_key,
+    )
 
     console.print(
         Panel.fit(

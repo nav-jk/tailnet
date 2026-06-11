@@ -1,0 +1,7 @@
+requests
+schedule
+rich
+fastapi
+uvicorn[standard]
+aiosqlite
+pydantic
