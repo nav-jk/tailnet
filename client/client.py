@@ -27,15 +27,18 @@ USERNAME: str = ""
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind(("", 0))
+sock.settimeout(0.5)   # ← non-blocking enough for recv loop, safe for sendto
 
 incoming_messages: list[tuple[tuple, str]] = []
 _msg_lock = threading.Lock()
+
+# Signals the chat printer thread to stop when we leave chat
+_in_chat = threading.Event()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def parse_peer(data: dict) -> dict:
-    """Normalize a peer dict — always give plain str ip and int port."""
     return {
         "username": data["username"],
         "ip":       str(data["ip"]),
@@ -89,9 +92,10 @@ def heartbeat():
         console.print(f"[red][HEARTBEAT ERROR] {e}[/red]")
 
 
-# ── UDP Receiver ──────────────────────────────────────────────────────────────
+# ── UDP Receiver (background thread) ─────────────────────────────────────────
 
 def udp_receiver():
+    """Receive all UDP packets and push to incoming_messages queue."""
     while True:
         try:
             data, addr = sock.recvfrom(4096)
@@ -100,8 +104,29 @@ def udp_receiver():
                 continue
             with _msg_lock:
                 incoming_messages.append((addr, decoded))
+        except socket.timeout:
+            continue          # normal — just loop again
         except Exception as e:
             console.print(f"[red][UDP ERROR] {e}[/red]")
+
+
+# ── Chat printer (background thread) ─────────────────────────────────────────
+
+def chat_printer(peer_name: str):
+    """
+    While in chat, continuously drain incoming_messages and print them.
+    Runs as a daemon thread so Prompt.ask on the main thread isn't blocked.
+    """
+    while _in_chat.is_set():
+        with _msg_lock:
+            while incoming_messages:
+                addr, msg = incoming_messages.pop(0)
+                # Print above the current input line
+                console.print(
+                    f"\n[green]{peer_name}[/green] "
+                    f"[dim]({addr[0]}:{addr[1]})[/dim]: {msg}"
+                )
+        time.sleep(0.1)
 
 
 # ── Hole Punching ─────────────────────────────────────────────────────────────
@@ -132,20 +157,17 @@ def chat_window(peer: dict):
     )
     console.print("[yellow]Type messages below. /exit to leave.[/yellow]\n")
 
+    # Send HELLO so peer's receiver confirms the hole is open
     try:
         sock.sendto(b"HELLO", (peer_ip, peer_port))
     except Exception:
         pass
 
-    while True:
-        with _msg_lock:
-            while incoming_messages:
-                addr, msg = incoming_messages.pop(0)
-                console.print(
-                    f"[green]{peer_name}[/green] "
-                    f"[dim]({addr[0]}:{addr[1]})[/dim]: {msg}"
-                )
+    # Start background printer
+    _in_chat.set()
+    threading.Thread(target=chat_printer, args=(peer_name,), daemon=True).start()
 
+    while True:
         try:
             msg = Prompt.ask("[bold cyan]You[/bold cyan]")
         except (EOFError, KeyboardInterrupt):
@@ -159,6 +181,7 @@ def chat_window(peer: dict):
         except Exception as e:
             console.print(f"[red]Send error: {e}[/red]")
 
+    _in_chat.clear()
     console.print("[yellow]Left chat.[/yellow]")
 
 
@@ -267,11 +290,8 @@ def check_incoming_requests():
             console.print(f"[red]Accept error (network): {e}[/red]")
             continue
 
-        # Guard: server might return an error dict
         if "ip" not in data:
-            console.print(
-                f"[red]Accept error: server said → {data}[/red]"
-            )
+            console.print(f"[red]Accept error: server said → {data}[/red]")
             continue
 
         peer = parse_peer(data)
