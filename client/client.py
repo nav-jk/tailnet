@@ -1,6 +1,7 @@
 import time
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 import requests
 import schedule
 import socket
@@ -8,6 +9,10 @@ from rich.table import Table
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
+from rich.text import Text
+from rich.columns import Columns
+from rich.rule import Rule
+from rich import box
 from stun_client import discover_endpoint_with_fallback
 
 BASE_URL = "https://server-try.fastapicloud.dev"
@@ -27,12 +32,10 @@ USERNAME: str = ""
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind(("", 0))
-sock.settimeout(0.5)   # ← non-blocking enough for recv loop, safe for sendto
+sock.settimeout(0.5)
 
 incoming_messages: list[tuple[tuple, str]] = []
 _msg_lock = threading.Lock()
-
-# Signals the chat printer thread to stop when we leave chat
 _in_chat = threading.Event()
 
 
@@ -45,12 +48,15 @@ def parse_peer(data: dict) -> dict:
         "port":     int(data["port"]),
     }
 
+def ts() -> str:
+    """Current time as HH:MM."""
+    return datetime.now().strftime("%H:%M")
+
 
 # ── STUN / Registration ───────────────────────────────────────────────────────
 
 def discover_endpoint() -> Client:
     external_ip, external_port = discover_endpoint_with_fallback(sock)
-    console.print(f"[dim][STUN] {external_ip}:{external_port}[/dim]")
     return Client(username=USERNAME, ip=external_ip, port=external_port)
 
 
@@ -61,9 +67,10 @@ def register():
             json={"username": client.username, "ip": client.ip, "port": client.port},
             timeout=5,
         )
-        console.print(f"[dim][REGISTER] {r.status_code}[/dim]")
+        if r.status_code != 200:
+            console.print(f"[dim red]  register failed {r.status_code}[/dim red]")
     except Exception as e:
-        console.print(f"[red][REGISTER ERROR] {e}[/red]")
+        console.print(f"[dim red]  register error: {e}[/dim red]")
 
 
 def refresh_endpoint():
@@ -71,31 +78,26 @@ def refresh_endpoint():
     try:
         new = discover_endpoint()
         if client is None or new.ip != client.ip or new.port != client.port:
-            console.print(f"[yellow][UPDATE] {new.ip}:{new.port}[/yellow]")
             client = new
             register()
-        else:
-            console.print("[dim][UPDATE] Endpoint unchanged[/dim]")
-    except Exception as e:
-        console.print(f"[red][REFRESH ERROR] {e}[/red]")
+    except Exception:
+        pass
 
 
 def heartbeat():
     try:
-        r = requests.post(
+        requests.post(
             f"{BASE_URL}/register",
             json={"username": client.username, "ip": client.ip, "port": client.port},
             timeout=5,
         )
-        console.print(f"[dim][HEARTBEAT] {r.status_code}[/dim]")
-    except Exception as e:
-        console.print(f"[red][HEARTBEAT ERROR] {e}[/red]")
+    except Exception:
+        pass
 
 
-# ── UDP Receiver (background thread) ─────────────────────────────────────────
+# ── UDP Receiver ──────────────────────────────────────────────────────────────
 
 def udp_receiver():
-    """Receive all UDP packets and push to incoming_messages queue."""
     while True:
         try:
             data, addr = sock.recvfrom(4096)
@@ -105,40 +107,38 @@ def udp_receiver():
             with _msg_lock:
                 incoming_messages.append((addr, decoded))
         except socket.timeout:
-            continue          # normal — just loop again
-        except Exception as e:
-            console.print(f"[red][UDP ERROR] {e}[/red]")
+            continue
+        except Exception:
+            pass
 
 
-# ── Chat printer (background thread) ─────────────────────────────────────────
+# ── Chat printer ──────────────────────────────────────────────────────────────
 
 def chat_printer(peer_name: str):
-    """
-    While in chat, continuously drain incoming_messages and print them.
-    Runs as a daemon thread so Prompt.ask on the main thread isn't blocked.
-    """
     while _in_chat.is_set():
         with _msg_lock:
             while incoming_messages:
-                addr, msg = incoming_messages.pop(0)
-                # Print above the current input line
-                console.print(
-                    f"\n[green]{peer_name}[/green] "
-                    f"[dim]({addr[0]}:{addr[1]})[/dim]: {msg}"
-                )
+                _, msg = incoming_messages.pop(0)
+                # Right-aligned peer bubble
+                bubble = Text()
+                bubble.append(f" {peer_name} ", style="bold white on dark_green")
+                bubble.append(f"  {msg}  ", style="white on grey23")
+                bubble.append(f" {ts()} ", style="dim")
+                console.print(bubble)
         time.sleep(0.1)
 
 
 # ── Hole Punching ─────────────────────────────────────────────────────────────
 
 def hole_punch(peer_ip: str, peer_port: int, rounds: int = 20):
-    console.print(f"[yellow]Punching hole to {peer_ip}:{peer_port}…[/yellow]")
+    console.print(f"[dim]  punching {peer_ip}:{peer_port}…[/dim]", end="\r")
     for _ in range(rounds):
         try:
             sock.sendto(b"HOLEPUNCH", (peer_ip, peer_port))
         except Exception:
             pass
         time.sleep(0.1)
+    console.print(" " * 40, end="\r")   # clear the line
 
 
 # ── Chat Window ───────────────────────────────────────────────────────────────
@@ -149,40 +149,52 @@ def chat_window(peer: dict):
     peer_name = peer["username"]
 
     console.clear()
-    console.print(
-        Panel.fit(
-            f"Connected to [green]{peer_name}[/green]  ({peer_ip}:{peer_port})",
-            title="MiniTail Chat",
-        )
-    )
-    console.print("[yellow]Type messages below. /exit to leave.[/yellow]\n")
 
-    # Send HELLO so peer's receiver confirms the hole is open
+    # Header
+    header = Text(justify="center")
+    header.append("  MiniTail  ", style="bold black on cyan")
+    header.append(f"  {peer_name}  ", style="bold white on dark_green")
+    header.append(f"  {peer_ip}:{peer_port}  ", style="dim")
+    console.print(header)
+    console.print(Rule(style="dim cyan"))
+    console.print(
+        f"  [dim]Connected at {datetime.now().strftime('%H:%M:%S')}  ·  /exit to leave[/dim]\n"
+    )
+
     try:
         sock.sendto(b"HELLO", (peer_ip, peer_port))
     except Exception:
         pass
 
-    # Start background printer
     _in_chat.set()
     threading.Thread(target=chat_printer, args=(peer_name,), daemon=True).start()
 
     while True:
         try:
-            msg = Prompt.ask("[bold cyan]You[/bold cyan]")
+            msg = Prompt.ask(f"[bold cyan] {USERNAME}[/bold cyan]")
         except (EOFError, KeyboardInterrupt):
             break
 
         if msg.strip() == "/exit":
             break
 
+        if not msg.strip():
+            continue
+
         try:
             sock.sendto(msg.encode(), (peer_ip, peer_port))
+            # Show own message right-aligned style
+            own = Text(justify="right")
+            own.append(f"  {msg}  ", style="white on steel_blue")
+            own.append(f" {ts()} ", style="dim")
+            console.print(own)
         except Exception as e:
-            console.print(f"[red]Send error: {e}[/red]")
+            console.print(f"[red]  send error: {e}[/red]")
 
     _in_chat.clear()
-    console.print("[yellow]Left chat.[/yellow]")
+    console.print()
+    console.print(Rule(style="dim"))
+    console.print("  [dim]Left chat.[/dim]\n")
 
 
 # ── Peer list ─────────────────────────────────────────────────────────────────
@@ -192,25 +204,35 @@ def show_peers():
         r = requests.get(f"{BASE_URL}/peers", timeout=5)
         peers = r.json()
 
-        table = Table(title="Online Peers")
-        table.add_column("Username", style="cyan")
-        table.add_column("", style="dim")
+        table = Table(
+            box=box.ROUNDED,
+            border_style="dim cyan",
+            header_style="bold cyan",
+            show_lines=False,
+        )
+        table.add_column("  #", style="dim", width=4)
+        table.add_column("Username", style="bold white")
+        table.add_column("Status", style="dim")
 
-        for p in peers:
-            table.add_row(p, "(you)" if p == USERNAME else "")
+        for i, p in enumerate(peers, 1):
+            status = "[green]● you[/green]" if p == USERNAME else "[green]● online[/green]"
+            table.add_row(f"  {i}", p, status)
 
+        console.print()
         console.print(table)
+        console.print()
+
     except Exception as e:
-        console.print(f"[red]Peer list error: {e}[/red]")
+        console.print(f"[red]  peer list error: {e}[/red]")
 
 
 # ── Outgoing connection request ───────────────────────────────────────────────
 
 def connect_peer():
-    peer_name = Prompt.ask("Enter peer username")
+    peer_name = Prompt.ask("  [cyan]Peer username[/cyan]")
 
     if peer_name == USERNAME:
-        console.print("[red]That's you.[/red]")
+        console.print("  [red]That's you.[/red]")
         return
 
     try:
@@ -220,27 +242,23 @@ def connect_peer():
             timeout=5,
         )
         if r.status_code != 200:
-            console.print(f"[red]Server error: {r.text}[/red]")
+            console.print(f"  [red]Server error: {r.text}[/red]")
             return
     except Exception as e:
-        console.print(f"[red]Request error: {e}[/red]")
+        console.print(f"  [red]Request error: {e}[/red]")
         return
 
     try:
         pr = requests.get(f"{BASE_URL}/peer/{peer_name}", timeout=5)
         if pr.status_code != 200:
-            console.print("[red]Peer not found.[/red]")
+            console.print("  [red]Peer not found.[/red]")
             return
         peer = parse_peer(pr.json())
     except Exception as e:
-        console.print(f"[red]Peer lookup error: {e}[/red]")
+        console.print(f"  [red]Peer lookup error: {e}[/red]")
         return
 
-    console.print(
-        f"[yellow]Request sent to [bold]{peer_name}[/bold]. "
-        "Hole-punching now — they need to accept on their end.[/yellow]"
-    )
-
+    console.print(f"\n  [yellow]Requesting {peer_name} · hole-punching…[/yellow]")
     hole_punch(peer["ip"], peer["port"])
     time.sleep(1)
     chat_window(peer)
@@ -260,12 +278,16 @@ def check_incoming_requests():
     for requester in requesters:
         from_name = requester["username"]
 
+        console.print()
         console.print(
-            f"\n[bold magenta]📞 Incoming request from "
-            f"[cyan]{from_name}[/cyan][/bold magenta]"
+            Panel.fit(
+                f"[bold white]📞  {from_name}[/bold white] wants to chat",
+                border_style="magenta",
+                padding=(0, 2),
+            )
         )
 
-        answer = Prompt.ask("Accept?", choices=["y", "n"], default="y")
+        answer = Prompt.ask("  Accept?", choices=["y", "n"], default="y")
 
         if answer == "n":
             try:
@@ -276,7 +298,7 @@ def check_incoming_requests():
                 )
             except Exception:
                 pass
-            console.print(f"[yellow]Declined {from_name}.[/yellow]")
+            console.print(f"  [dim]Declined {from_name}.[/dim]")
             continue
 
         try:
@@ -287,37 +309,61 @@ def check_incoming_requests():
             )
             data = ar.json()
         except Exception as e:
-            console.print(f"[red]Accept error (network): {e}[/red]")
+            console.print(f"  [red]Accept error: {e}[/red]")
             continue
 
         if "ip" not in data:
-            console.print(f"[red]Accept error: server said → {data}[/red]")
+            console.print(f"  [red]Accept failed: {data}[/red]")
             continue
 
         peer = parse_peer(data)
-
-        console.print(f"[green]Accepted! Connecting to {from_name}…[/green]")
+        console.print(f"  [green]Connecting to {from_name}…[/green]")
         hole_punch(peer["ip"], peer["port"])
         time.sleep(0.5)
         chat_window(peer)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main menu ─────────────────────────────────────────────────────────────────
+
+def draw_menu():
+    console.print(
+        Panel(
+            "  [bold cyan]1[/bold cyan]  Show peers\n"
+            "  [bold cyan]2[/bold cyan]  Connect to peer\n"
+            "  [bold cyan]3[/bold cyan]  Exit",
+            title="[bold white]MiniTail[/bold white]",
+            border_style="cyan",
+            padding=(0, 2),
+            box=box.ROUNDED,
+        )
+    )
+
 
 def main():
     global client, USERNAME
 
-    USERNAME = Prompt.ask("[bold cyan]Enter your username[/bold cyan]")
+    console.clear()
+    console.print(
+        Panel.fit(
+            "[bold cyan]MiniTail[/bold cyan]  [dim]p2p encrypted chat[/dim]",
+            border_style="cyan",
+            padding=(0, 2),
+        )
+    )
+    console.print()
 
+    USERNAME = Prompt.ask("  [bold cyan]Username[/bold cyan]")
+
+    console.print("\n  [dim]Discovering your endpoint…[/dim]")
     client = discover_endpoint()
 
     console.print(
-        Panel.fit(
-            f"[bold cyan]MiniTail Client[/bold cyan]\n\n"
-            f"Username : {client.username}\n"
-            f"Public IP: {client.ip}\n"
-            f"Port     : {client.port}",
-            title="Client Information",
+        Panel(
+            f"  [dim]username[/dim]   [bold white]{client.username}[/bold white]\n"
+            f"  [dim]public ip[/dim]  [bold white]{client.ip}[/bold white]\n"
+            f"  [dim]port[/dim]       [bold white]{client.port}[/bold white]",
+            border_style="dim cyan",
+            padding=(0, 1),
         )
     )
 
@@ -331,24 +377,16 @@ def main():
     while True:
         schedule.run_pending()
         check_incoming_requests()
+        draw_menu()
 
-        console.print(
-            Panel.fit(
-                "[1] Show Peers\n"
-                "[2] Connect to Peer\n"
-                "[3] Exit",
-                title="MiniTail",
-            )
-        )
-
-        choice = Prompt.ask("Select option", choices=["1", "2", "3"])
+        choice = Prompt.ask("  [bold]›[/bold]", choices=["1", "2", "3"])
 
         if choice == "1":
             show_peers()
         elif choice == "2":
             connect_peer()
         elif choice == "3":
-            console.print("[yellow]Shutting down MiniTail…[/yellow]")
+            console.print("\n  [dim]Goodbye.[/dim]\n")
             break
 
 
