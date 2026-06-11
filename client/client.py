@@ -12,8 +12,6 @@ from stun_client import discover_endpoint_with_fallback
 
 BASE_URL = "https://server-try.fastapicloud.dev"
 
-USERNAME = "nav"
-
 console = Console()
 
 # ── Global state ─────────────────────────────────────────────────────────────
@@ -25,6 +23,7 @@ class Client:
     port: int
 
 client: Client | None = None
+USERNAME: str = ""
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind(("", 0))
@@ -32,7 +31,16 @@ sock.bind(("", 0))
 incoming_messages: list[tuple[tuple, str]] = []
 _msg_lock = threading.Lock()
 
-active_peer_addr: tuple | None = None
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def parse_peer(data: dict) -> dict:
+    """Normalize a peer dict — always give plain str ip and int port."""
+    return {
+        "username": data["username"],
+        "ip":       str(data["ip"]),
+        "port":     int(data["port"]),
+    }
 
 
 # ── STUN / Registration ───────────────────────────────────────────────────────
@@ -111,13 +119,9 @@ def hole_punch(peer_ip: str, peer_port: int, rounds: int = 20):
 # ── Chat Window ───────────────────────────────────────────────────────────────
 
 def chat_window(peer: dict):
-    global active_peer_addr
-
-    peer_ip   = str(peer["ip"])
-    peer_port = int(peer["port"])
+    peer_ip   = peer["ip"]
+    peer_port = peer["port"]
     peer_name = peer["username"]
-
-    active_peer_addr = (peer_ip, peer_port)
 
     console.clear()
     console.print(
@@ -138,7 +142,8 @@ def chat_window(peer: dict):
             while incoming_messages:
                 addr, msg = incoming_messages.pop(0)
                 console.print(
-                    f"[green]{peer_name}[/green] [dim]({addr[0]}:{addr[1]})[/dim]: {msg}"
+                    f"[green]{peer_name}[/green] "
+                    f"[dim]({addr[0]}:{addr[1]})[/dim]: {msg}"
                 )
 
         try:
@@ -154,32 +159,38 @@ def chat_window(peer: dict):
         except Exception as e:
             console.print(f"[red]Send error: {e}[/red]")
 
-    active_peer_addr = None
     console.print("[yellow]Left chat.[/yellow]")
 
 
-# ── Peer UI ───────────────────────────────────────────────────────────────────
+# ── Peer list ─────────────────────────────────────────────────────────────────
 
 def show_peers():
     try:
         r = requests.get(f"{BASE_URL}/peers", timeout=5)
-        peers = [p for p in r.json() if p != USERNAME]
+        peers = r.json()
+
         table = Table(title="Online Peers")
         table.add_column("Username", style="cyan")
+        table.add_column("", style="dim")
+
         for p in peers:
-            table.add_row(p)
+            table.add_row(p, "(you)" if p == USERNAME else "")
+
         console.print(table)
     except Exception as e:
         console.print(f"[red]Peer list error: {e}[/red]")
 
 
-# ── Phase 7: Outgoing connection request ──────────────────────────────────────
+# ── Outgoing connection request ───────────────────────────────────────────────
 
 def connect_peer():
     peer_name = Prompt.ask("Enter peer username")
 
+    if peer_name == USERNAME:
+        console.print("[red]That's you.[/red]")
+        return
+
     try:
-        # Tell the server we want to connect
         r = requests.post(
             f"{BASE_URL}/connect",
             json={"from_user": USERNAME, "to_user": peer_name},
@@ -192,52 +203,29 @@ def connect_peer():
         console.print(f"[red]Request error: {e}[/red]")
         return
 
-    console.print(
-        f"[yellow]Request sent to [bold]{peer_name}[/bold]. "
-        "Waiting for them to accept…  (Ctrl-C to cancel)[/yellow]"
-    )
-
-    # Poll until the peer accepts (their /accept returns their endpoint)
-    # We detect acceptance by checking if our pending request disappears
-    # AND we receive a HELLO from them, OR we can poll a dedicated status.
-    #
-    # Simpler approach: poll /peer/{peer_name} (already registered) and
-    # just start hole-punching once we confirm the peer is online.
-    # The peer's client will call /accept which gives them our endpoint;
-    # we already know theirs from /peer.
     try:
         pr = requests.get(f"{BASE_URL}/peer/{peer_name}", timeout=5)
         if pr.status_code != 200:
             console.print("[red]Peer not found.[/red]")
             return
-        peer = pr.json()
-        peer["ip"]   = str(peer["ip"])
-        peer["port"] = int(peer["port"])
+        peer = parse_peer(pr.json())
     except Exception as e:
         console.print(f"[red]Peer lookup error: {e}[/red]")
         return
 
     console.print(
-        "[cyan]Initiating hole punch. "
-        "Chat will open once the peer accepts.[/cyan]"
+        f"[yellow]Request sent to [bold]{peer_name}[/bold]. "
+        "Hole-punching now — they need to accept on their end.[/yellow]"
     )
 
-    # Hole punch from our side immediately
     hole_punch(peer["ip"], peer["port"])
-
-    # Wait briefly for the peer to accept and start punching back
     time.sleep(1)
-
     chat_window(peer)
 
 
-# ── Phase 7: Incoming request polling ────────────────────────────────────────
+# ── Incoming request polling ──────────────────────────────────────────────────
 
 def check_incoming_requests():
-    """
-    Called from the main loop every cycle.
-    If someone has requested to connect, prompt the user to accept/decline.
-    """
     try:
         r = requests.get(f"{BASE_URL}/requests/{USERNAME}", timeout=5)
         if r.status_code != 200:
@@ -250,7 +238,7 @@ def check_incoming_requests():
         from_name = requester["username"]
 
         console.print(
-            f"\n[bold magenta]📞 Incoming connection request from "
+            f"\n[bold magenta]📞 Incoming request from "
             f"[cyan]{from_name}[/cyan][/bold magenta]"
         )
 
@@ -268,33 +256,38 @@ def check_incoming_requests():
             console.print(f"[yellow]Declined {from_name}.[/yellow]")
             continue
 
-        # Accept — server returns initiator's current endpoint
         try:
             ar = requests.post(
                 f"{BASE_URL}/accept",
                 json={"from_user": from_name, "to_user": USERNAME},
                 timeout=5,
             )
-            peer = ar.json()
-            peer["ip"]   = str(peer["ip"])
-            peer["port"] = int(peer["port"])
+            data = ar.json()
         except Exception as e:
-            console.print(f"[red]Accept error: {e}[/red]")
+            console.print(f"[red]Accept error (network): {e}[/red]")
             continue
 
-        console.print(f"[green]Accepted! Connecting to {from_name}…[/green]")
+        # Guard: server might return an error dict
+        if "ip" not in data:
+            console.print(
+                f"[red]Accept error: server said → {data}[/red]"
+            )
+            continue
 
-        # Both sides hole-punch simultaneously
+        peer = parse_peer(data)
+
+        console.print(f"[green]Accepted! Connecting to {from_name}…[/green]")
         hole_punch(peer["ip"], peer["port"])
         time.sleep(0.5)
-
         chat_window(peer)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global client
+    global client, USERNAME
+
+    USERNAME = Prompt.ask("[bold cyan]Enter your username[/bold cyan]")
 
     client = discover_endpoint()
 
@@ -317,8 +310,6 @@ def main():
 
     while True:
         schedule.run_pending()
-
-        # Check for incoming requests on every loop iteration
         check_incoming_requests()
 
         console.print(
