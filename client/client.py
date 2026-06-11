@@ -10,7 +10,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from stun_client import discover_endpoint_with_fallback
 
-BASE_URL = "https://server-try.fastapicloud.dev"
+BASE_URL = "http://129.121.114.238:8000"
 
 console = Console()
 
