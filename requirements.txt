@@ -1,7 +1,8 @@
 requests
 schedule
 rich
-fastapi
-uvicorn[standard]
+pynacl
 aiosqlite
+fastapi
 pydantic
+uvicorn
